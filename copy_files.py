@@ -1,3 +1,4 @@
+import fnmatch
 import os
 import subprocess
 import sys
@@ -36,17 +37,47 @@ def cp_ls(src_ls, dst_ls):
             yield idx, errs
 
 
-def ls_dir(dir_path):
+def ls_dir(dir_path, exclusions, verbose=False):
     """Returns a list of all directories, and files in a directory (recursively)."""
+
+    def check_exclusions(root, ls, res_ls):
+        """Checks all elements in ls for exclusions. If things aren't excluded, they're appended to res_ls."""
+
+        for cur in ls:
+            p = os.path.join(root, cur)
+            if exclude_path(cur, exclusions):
+                if verbose:
+                    print(f'Excluding {p}')
+                continue
+            else:
+                res_ls.append(p)
+
     dirs_result = []
     files_result = []
 
     # Append paths to all files and dirs to results
     for root, dirs, files in os.walk(dir_path):
-        dirs_result.extend([os.path.join(root, current_dirs) for current_dirs in dirs])
-        files_result.extend([os.path.join(root, current_files) for current_files in files])
+        if exclude_path(root, exclusions):
+            continue
+
+        # Check dirs for exclusions
+        check_exclusions(root, dirs, dirs_result)
+
+        # Check files for exclusions
+        check_exclusions(root, files, files_result)
 
     return dirs_result, files_result
+
+
+def exclude_path(path, exclusions):
+    """
+    Takes a list of exclusion wildcard patterns and returns True if a path matches one.
+    So, if this returns True, the path should be excluded.
+    """
+    for pat in exclusions:
+        if fnmatch.fnmatchcase(path, pat):
+            return True
+    return False
 
 
 def change_parent(old, new, paths):
@@ -65,19 +96,19 @@ def change_parent(old, new, paths):
         return result
 
 
-def clean_meta_dict(meta):
-    """Takes a meta dict from osxmetadata.asdict and removes the keys starting with _."""
-    result = {}
-    for key, value in meta.asdict(True, True).items():
-        if not key.startswith("_"):
-            # skip private keys like _version and _filepath
-            result[key] = value
-
-    return result
-
-
 def check_meta(src, dst):
     """Checks src's metadata against dst's."""
+
+    def clean_meta_dict(meta):
+        """Takes a meta dict from osxmetadata.asdict and removes the keys starting with _."""
+        result = {}
+        for key, value in meta.asdict(True, True).items():
+            if not key.startswith("_"):
+                # skip private keys like _version and _filepath
+                result[key] = value
+
+        return result
+
     src_meta = OSXMetaData(src)
     src_meta_dict = clean_meta_dict(src_meta)
     dst_meta = OSXMetaData(dst)
@@ -116,6 +147,10 @@ if __name__ == '__main__':
     SRC = '/Volumes/Archive/GRAPHIC RESOURCES'
     # The folder to copy to
     DST = '/Volumes/test/copy_files'
+    # The progress file
+    PROG_FILE = os.path.join(SRC, '.cp_progress')
+    # List of file wildcards to exclude
+    EXCLUSIONS = ['.cp_progress', 'Thumbs.db']
 
     print(f'Copying folder {SRC} to {DST}')
     proceed = input('Does this look correct? y/n: ').lower()
@@ -124,7 +159,7 @@ if __name__ == '__main__':
         sys.exit(1)
 
     print(f'Getting list of directories and files in {SRC}...')
-    old_dir_list, old_file_list = ls_dir(SRC)
+    old_dir_list, old_file_list = ls_dir(SRC, EXCLUSIONS, verbose=True)
 
     # Get new lists with the parents changed from SRC to DST
     new_dir_list, new_file_list = change_parent(SRC, DST, old_dir_list), change_parent(SRC, DST, old_file_list)
