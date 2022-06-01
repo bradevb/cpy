@@ -2,6 +2,10 @@ import os
 import subprocess
 import sys
 
+from osxmetadata import OSXMetaData
+
+SPACE = ' ' * 10  # Used in place of printing two tabs
+
 
 def cp(src, dst):
     """Copies src to dst. Uses flags -Rpn to preserve resource forks."""
@@ -61,6 +65,40 @@ def change_parent(old, new, paths):
         return result
 
 
+def clean_meta_dict(meta):
+    """Takes a meta dict from osxmetadata.asdict and removes the keys starting with _."""
+    result = {}
+    for key, value in meta.asdict(True, True).items():
+        if not key.startswith("_"):
+            # skip private keys like _version and _filepath
+            result[key] = value
+
+    return result
+
+
+def check_meta(src, dst):
+    """Checks src's metadata against dst's."""
+    src_meta = OSXMetaData(src)
+    src_meta_dict = clean_meta_dict(src_meta)
+    dst_meta = OSXMetaData(dst)
+    dst_meta_dict = clean_meta_dict(dst_meta)
+
+    if src_meta_dict != dst_meta_dict:
+        dst_meta._restore_attributes(src_meta.asdict(all_=True, encode=True), all_=True)
+        # Need to specifically set the following. They don't seem to get set with restore_attributes.
+        dst_meta.finderinfo.set_finderinfo_stationarypad(src_meta.stationarypad)
+        dst_meta.tags = src_meta.tags
+
+
+def check_meta_ls(old, new):
+    """Checks metadata of old against new. If it finds a difference, the old's metadata is copied to new."""
+    ls_len = len(old)
+    for idx, (src, dst) in enumerate(zip(old, new), start=1):
+        check_meta(src, dst)
+        print(f'Restored {idx}/{ls_len}...', end='\r')
+    print()
+
+
 def copy_with_progress(old, new):
     """Convenience function for copying files/dirs while displaying progress."""
     cp_errs = []
@@ -68,13 +106,14 @@ def copy_with_progress(old, new):
 
     for c, errs in cp_ls(old, new):
         cp_errs = errs
-        print(f'Copied {c}/{ls_len}...\t\tErrors: {len(cp_errs)}', end='\r')
+        print(f'Copied {c}/{ls_len}...{SPACE}Errors: {len(cp_errs)}', end='\r', flush=True)
+    print()
     return cp_errs
 
 
 if __name__ == '__main__':
     # The parent folder to be copied
-    SRC = '/Volumes/Archive/TEMPLATES'
+    SRC = '/Volumes/Archive/GRAPHIC RESOURCES'
     # The folder to copy to
     DST = '/Volumes/test/copy_files'
 
@@ -86,16 +125,26 @@ if __name__ == '__main__':
 
     print(f'Getting list of directories and files in {SRC}...')
     old_dir_list, old_file_list = ls_dir(SRC)
+
     # Get new lists with the parents changed from SRC to DST
     new_dir_list, new_file_list = change_parent(SRC, DST, old_dir_list), change_parent(SRC, DST, old_file_list)
-    dir_ls_len, file_ls_len = len(old_dir_list), len(old_file_list)
 
-    # Copy dirs to new destination
+    # Copy files to new destination
+    print(f'COPYING {len(old_file_list)} FILES...')
+    file_cp_errs = copy_with_progress(old_file_list, new_file_list)
+    print(f'All files copied. Errors encountered: {len(file_cp_errs)}')
+
+    # Copy dirs to new destination (only empty dirs should need to be created)
     print(f'COPYING {len(old_dir_list)} DIRECTORIES...')
     dir_cp_errs = copy_with_progress(old_dir_list, new_dir_list)
     print(f'All directories copied. Errors encountered: {len(dir_cp_errs)}', flush=True)
 
-    # Copy files to new destination:
-    print(f'COPYING {len(old_file_list)} FILES...')
-    file_cp_errs = copy_with_progress(old_file_list, new_file_list)
-    print(f'All files copied. Errors encountered: {len(file_cp_errs)}', flush=True)
+    # Restore metadata to files
+    print(f'RESTORING METADATA TO {len(old_file_list)} FILES...')
+    check_meta_ls(old_file_list, new_file_list)
+
+    # Restore metadata to folders
+    print(f'RESTORING METADATA TO {len(old_dir_list)} DIRECTORIES...')
+    check_meta_ls(old_dir_list, new_dir_list)
+
+    print('Done!')
