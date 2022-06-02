@@ -2,7 +2,9 @@ import fnmatch
 import os
 import subprocess
 import sys
+import traceback
 
+from diskcache import Cache
 from osxmetadata import OSXMetaData
 
 SPACE = ' ' * 10  # Used in place of printing two tabs
@@ -24,15 +26,29 @@ def cp_ls(src_ls, dst_ls):
     """
     errs = []
     for idx, (src, dst) in enumerate(zip(src_ls, dst_ls), start=1):
+        prev_err = prog_cache.get(src)
+
         try:
-            if os.path.exists(dst):
-                yield idx, errs
+            # Check and see if src has errored before, and if it's gone over attempts limit.
+            if prev_err is not None and prev_err['attempts'] >= ATTEMPTS:
+                print(f"File {src} has reached its attempt limit. "
+                      f"Try manually copying this file, or investigate what's going wrong.")
                 continue
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            cp(src, dst)
-            yield idx, errs
+
+            if not os.path.exists(dst):
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                cp(src, dst)
+            prog_cache.delete(src)
         except Exception as e:
-            errs.append([src, dst, e])
+            if prev_err is None:
+                prog_cache.set(src, {'src': src, 'dst': dst, 'attempts': 1,
+                                     'exception': e, 'traceback': traceback.format_exc()})
+            elif prev_err['attempts'] < ATTEMPTS:
+                prev_err['attempts'] += 1
+                prog_cache.set(src, prev_err)
+
+            errs.append(src)
+
         finally:
             yield idx, errs
 
@@ -143,14 +159,27 @@ def copy_with_progress(old, new):
 
 
 if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-r', '--reset', help='reset the failed file database', action='store_true')
+    args = parser.parse_args()
     # The parent folder to be copied
     SRC = '/Volumes/Archive/GRAPHIC RESOURCES'
     # The folder to copy to
     DST = '/Volumes/test/copy_files'
     # The progress file
-    PROG_FILE = os.path.join(SRC, '.cp_progress')
+    # PROG_FILE = os.path.join(SRC, '.cp_progress')
+    # prog_cache = Cache(PROG_FILE)
+    prog_cache = Cache('cp_progress')
     # List of file wildcards to exclude
     EXCLUSIONS = ['.cp_progress', 'Thumbs.db']
+    # Number of attempts to retry failed files
+    ATTEMPTS = 3
+
+    if args.reset:
+        print('Resetting failed file database...')
+        prog_cache.clear()
 
     print(f'Copying folder {SRC} to {DST}')
     proceed = input('Does this look correct? y/n: ').lower()
@@ -174,12 +203,32 @@ if __name__ == '__main__':
     dir_cp_errs = copy_with_progress(old_dir_list, new_dir_list)
     print(f'All directories copied. Errors encountered: {len(dir_cp_errs)}', flush=True)
 
-    # Restore metadata to files
-    print(f'RESTORING METADATA TO {len(old_file_list)} FILES...')
-    check_meta_ls(old_file_list, new_file_list)
+    # Retry until all files and dirs have been copied or until files reach attempt limit
+    print(f'Retrying files and directories with errors up to {ATTEMPTS} attempts...')
 
-    # Restore metadata to folders
-    print(f'RESTORING METADATA TO {len(old_dir_list)} DIRECTORIES...')
-    check_meta_ls(old_dir_list, new_dir_list)
+    c = 0
+    while c < ATTEMPTS or True:
+        # Retry files that are under the attempt limit
+        combined_errs = [prog_cache.get(x) for x in prog_cache.iterkeys()]
+
+        src_retries = [d['src'] for d in combined_errs if d['attempts'] < ATTEMPTS]
+        dst_retries = [d['dst'] for d in combined_errs if d['attempts'] < ATTEMPTS]
+
+        print(f'{len(src_retries)} files/directories to be retried.')
+        if not copy_with_progress(src_retries, dst_retries):
+            print('All files/directories have been copied or have reached their error limit.')
+            break
+
+    # Filter out files that didn't make it from old and new file/dir lists before metadata copy
+    old_list = old_file_list + old_dir_list
+    new_list = new_file_list + new_dir_list
+    for key in prog_cache.iterkeys():
+        err = prog_cache.get(key)
+        old_list.remove(err['src'])
+        new_list.remove(err['dst'])
+
+    # Restore metadata to files/dirs
+    print(f'RESTORING METADATA TO {len(old_list)} FILES/DIRECTORIES...')
+    check_meta_ls(old_list, new_list)
 
     print('Done!')
