@@ -1,19 +1,33 @@
+#!/usr/bin/env python3
+
+import filecmp
 import fnmatch
 import os
 import subprocess
-import sys
+import time
 import traceback
 
+from Foundation import NSFileManager
 from diskcache import Cache
 from osxmetadata import OSXMetaData
 
 SPACE = ' ' * 10  # Used in place of printing two tabs
+PROG_FILE_NAME = '.cp_progress'
+manager = NSFileManager.defaultManager()
 
 
 def cp(src, dst):
     """Copies src to dst. Uses flags -Rpn to preserve resource forks."""
     res = subprocess.run(['/bin/cp', '-Rpn', src, f'{os.path.dirname(dst)}'], check=True)
     return res
+
+
+def clone_attrs(src, dst):
+    """Clones attributes from src to dst. Use this to keep attrs the same after copying files across filesystems."""
+    src_attrs = manager.attributesOfItemAtPath_error_(src, None)[0]
+    success, err = manager.setAttributes_ofItemAtPath_error_(src_attrs, dst, None)
+    if not success:
+        raise Exception(f'Error cloning attrs from {src} to {dst}. Error is {err}', err)
 
 
 def cp_ls(src_ls, dst_ls):
@@ -35,9 +49,13 @@ def cp_ls(src_ls, dst_ls):
                       f"Try manually copying this file, or investigate what's going wrong.")
                 continue
 
-            if not os.path.exists(dst):
+            if os.path.isfile(dst) and (args.compare and not filecmp.cmp(src, dst, shallow=args.shallow)):
+                print(f'File {dst} failed comparison. Deleting it and trying again.')
+                os.unlink(dst)
+            elif not os.path.exists(dst):
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 cp(src, dst)
+            clone_attrs(src, dst)
             prog_cache.delete(src)
         except Exception as e:
             if prev_err is None:
@@ -61,7 +79,7 @@ def ls_dir(dir_path, exclusions, verbose=False):
 
         for cur in ls:
             p = os.path.join(root, cur)
-            if exclude_path(cur, exclusions):
+            if exclude_path(p, exclusions):
                 if verbose:
                     print(f'Excluding {p}')
                 continue
@@ -148,13 +166,16 @@ def check_meta_ls(old, new):
 
 def copy_with_progress(old, new):
     """Convenience function for copying files/dirs while displaying progress."""
-    cp_errs = []
     ls_len = len(old)
+    if not ls_len:
+        return []
+    cp_errs = []
+    start = time.time()
 
     for c, errs in cp_ls(old, new):
         cp_errs = errs
         print(f'Copied {c}/{ls_len}...{SPACE}Errors: {len(cp_errs)}', end='\r', flush=True)
-    print()
+    print(f'Copied {ls_len}/{ls_len}...{SPACE}Time elapsed: {round(time.time() - start, 2)}')
     return cp_errs
 
 
@@ -162,33 +183,36 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser()
+    parser.add_argument('src', help='source directory')
+    parser.add_argument('dst', help='destination directory')
     parser.add_argument('-r', '--reset', help='reset the failed file database', action='store_true')
+    parser.add_argument('-c', '--compare', help='compare file contents if file exists on dst', action='store_true')
+    parser.add_argument('-s', '--shallow',
+                        help='when comparing, perform shallow comparison instead of byte-by-byte', action='store_true')
+    parser.add_argument('--no-cache', help='disable persistent failed file database '
+                                           '(a temp one will still be created)', action='store_true')
+    parser.add_argument('-a', '--attempts', help='number of attempts before giving up on a file',
+                        type=int, default=3)
+    parser.add_argument('-e', '--exclude', help='space-separated list of file patterns to exclude',
+                        nargs='+', default=[f'*{PROG_FILE_NAME}*'])
     args = parser.parse_args()
-    # The parent folder to be copied
-    SRC = '/Volumes/Archive/GRAPHIC RESOURCES'
-    # The folder to copy to
-    DST = '/Volumes/test/copy_files'
+
+    SRC = args.src
+    DST = args.dst
+    ATTEMPTS = args.attempts
+
     # The progress file
-    # PROG_FILE = os.path.join(SRC, '.cp_progress')
-    # prog_cache = Cache(PROG_FILE)
-    prog_cache = Cache('cp_progress')
-    # List of file wildcards to exclude
-    EXCLUSIONS = ['.cp_progress', 'Thumbs.db']
-    # Number of attempts to retry failed files
-    ATTEMPTS = 3
+    print('Loading progress file...')
+    prog_cache = Cache(os.path.join(SRC, PROG_FILE_NAME) if not args.no_cache else None)
 
     if args.reset:
         print('Resetting failed file database...')
         prog_cache.clear()
 
     print(f'Copying folder {SRC} to {DST}')
-    proceed = input('Does this look correct? y/n: ').lower()
-    if proceed != 'y':
-        print('Exiting.')
-        sys.exit(1)
 
     print(f'Getting list of directories and files in {SRC}...')
-    old_dir_list, old_file_list = ls_dir(SRC, EXCLUSIONS, verbose=True)
+    old_dir_list, old_file_list = ls_dir(SRC, args.exclude, verbose=True)
 
     # Get new lists with the parents changed from SRC to DST
     new_dir_list, new_file_list = change_parent(SRC, DST, old_dir_list), change_parent(SRC, DST, old_file_list)
