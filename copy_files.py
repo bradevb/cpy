@@ -3,6 +3,7 @@
 import filecmp
 import fnmatch
 import os
+import shutil
 import subprocess
 import time
 import traceback
@@ -16,18 +17,81 @@ PROG_FILE_NAME = '.cp_progress'
 manager = NSFileManager.defaultManager()
 
 
+# TODO: see what's up with all these fchflags errors. A directory
+#  that had a ton of them is /Volumes/Archive/ARCHIVE/B/Brower.
+#  Maybe have a command line arg to retry failed files instantly with shutil.copy2.
+
+
 def cp(src, dst):
     """Copies src to dst. Uses flags -Rpn to preserve resource forks."""
     res = subprocess.run(['/bin/cp', '-Rpn', src, f'{os.path.dirname(dst)}'], check=True)
     return res
 
 
-def clone_attrs(src, dst):
-    """Clones attributes from src to dst. Use this to keep attrs the same after copying files across filesystems."""
-    src_attrs = manager.attributesOfItemAtPath_error_(src, None)[0]
-    success, err = manager.setAttributes_ofItemAtPath_error_(src_attrs, dst, None)
-    if not success:
-        raise Exception(f'Error cloning attrs from {src} to {dst}. Error is {err}', err)
+def clone_attrs(src, dst, follow_symlinks=True, limit=10):
+    """
+    Clones attributes from src to dst. Use this to keep attrs the same after copying files across filesystems.
+    Returns True if success, False if otherwise (or raises exception).
+    Will attempt to clone attrs up to *limit* times.
+    """
+
+    def get_desired_attrs(attrs):
+        """Gets the important attrs from an NSDictionary of file attrs"""
+        desired_attrs = ['NSFileExtensionHidden', 'NSFileCreationDate', 'NSFileModificationDate']
+        return {k: v for k, v in dict(attrs).items() if k in desired_attrs}
+
+    def clone():
+        if follow_symlinks:
+            src_attrs = manager.attributesOfItemAtPath_error_(src, None)[0]
+
+            # Check if it's necessary to copy the attrs
+            d_src_attrs = get_desired_attrs(src_attrs)
+            d_dst_attrs = get_desired_attrs(manager.attributesOfItemAtPath_error_(dst, None)[0])
+            if d_src_attrs == d_dst_attrs:
+                return True
+
+            success, err = manager.setAttributes_ofItemAtPath_error_(d_src_attrs, dst, None)
+            if not success:
+                raise Exception(f'Error cloning attrs from {src} to {dst}')
+
+            # Get dst attrs to see if they changed. If not, try again
+            d_dst_attrs = get_desired_attrs(manager.attributesOfItemAtPath_error_(dst, None)[0])
+            if d_src_attrs != d_dst_attrs:
+                return False
+        else:
+            shutil.copystat(src, dst, follow_symlinks=False)
+        return True
+
+    for i in range(limit):
+        if clone():
+            return
+
+
+def paths_are(os_path_func, *args, cmp_func=all):
+    """
+    Pass in a function from os.path (like os.path.isfile), then pass as many paths as you'd like.
+    By default, returns True if all the os_path_funcs return True.
+    You can change the comparison function by passing e.g. cmp_func=any
+    """
+    return cmp_func([os_path_func(path) for path in args])
+
+
+def cmp(src, dst, shallow):
+    """Compares symlinks to symlinks and files to files. If given a symlink and a file, treats link as a file."""
+
+    def cmp_links(a, b):
+        """Given paths to symlinks a and b, return True if they both point to the same file."""
+        return os.readlink(a) == os.readlink(b)
+
+    if paths_are(os.path.islink, src, dst):
+        return cmp_links(src, dst)
+    elif paths_are(os.path.isfile, src, dst):
+        return filecmp.cmp(src, dst, shallow=shallow)
+    elif paths_are(os.path.isdir, src, dst):
+        dcmp = filecmp.dircmp(src, dst)
+        return bool(dcmp.left_only or dcmp.right_only or dcmp.diff_files)
+
+    return False
 
 
 def cp_ls(src_ls, dst_ls):
@@ -44,18 +108,32 @@ def cp_ls(src_ls, dst_ls):
 
         try:
             # Check and see if src has errored before, and if it's gone over attempts limit.
-            if prev_err is not None and prev_err['attempts'] >= ATTEMPTS:
-                print(f"File {src} has reached its attempt limit. "
-                      f"Try manually copying this file, or investigate what's going wrong.")
-                continue
+            # Also, do a byte-by-byte compare on the file to see if it was copied correctly.
+            if prev_err is not None:
+                if prev_err['attempts'] >= ATTEMPTS:
+                    print(f"File {src} has reached its attempt limit. "
+                          f"Try manually copying this file, or investigate what's going wrong.")
+                    continue
+                elif cmp(src, dst, False):
+                    # If we reach this, the file has actually been copied over just fine.
+                    # Proceed to make sure that metadata is copied and remove from prog_cache
+                    print(f'File {dst} has been copied over despite its error.')
+                    clone_attrs(src, dst, follow_symlinks=not os.path.islink(dst), limit=50)
+                    prog_cache.delete(src)
+                    continue
 
-            if os.path.isfile(dst) and (args.compare and not filecmp.cmp(src, dst, shallow=args.shallow)):
-                print(f'File {dst} failed comparison. Deleting it and trying again.')
+            if (os.path.isfile(dst) or os.path.islink(dst)) and \
+                    (args.compare and not cmp(src, dst, shallow=args.shallow)):
+                print(f'File/dir {dst} failed comparison. Deleting it and trying again.')
                 os.unlink(dst)
-            elif not os.path.exists(dst):
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                cp(src, dst)
-            clone_attrs(src, dst)
+            if not os.path.exists(dst) and not os.path.islink(dst):
+                if os.path.isdir(src):
+                    # Treat dirs specially - if a dir hasn't been created yet, it's empty, so no need to cp
+                    os.makedirs(dst, exist_ok=True)
+                else:
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    cp(src, dst)
+            clone_attrs(src, dst, follow_symlinks=not os.path.islink(dst), limit=50)
             prog_cache.delete(src)
         except Exception as e:
             if prev_err is None:
@@ -159,7 +237,9 @@ def check_meta_ls(old, new):
     """Checks metadata of old against new. If it finds a difference, the old's metadata is copied to new."""
     ls_len = len(old)
     for idx, (src, dst) in enumerate(zip(old, new), start=1):
-        check_meta(src, dst)
+        # We can skip meta check for symlinks since the files they point to will be checked
+        if not paths_are(os.path.islink, src, dst, cmp_func=any):
+            check_meta(src, dst)
         print(f'Restored {idx}/{ls_len}...', end='\r')
     print()
 
@@ -191,8 +271,9 @@ if __name__ == '__main__':
                         help='when comparing, perform shallow comparison instead of byte-by-byte', action='store_true')
     parser.add_argument('--no-cache', help='disable persistent failed file database '
                                            '(a temp one will still be created)', action='store_true')
+    parser.add_argument('--cache-dir', help='custom dir for failed file database')
     parser.add_argument('-a', '--attempts', help='number of attempts before giving up on a file',
-                        type=int, default=3)
+                        type=int, default=5)
     parser.add_argument('-e', '--exclude', help='space-separated list of file patterns to exclude',
                         nargs='+', default=[f'*{PROG_FILE_NAME}*'])
     args = parser.parse_args()
@@ -203,7 +284,10 @@ if __name__ == '__main__':
 
     # The progress file
     print('Loading progress file...')
-    prog_cache = Cache(os.path.join(SRC, PROG_FILE_NAME) if not args.no_cache else None)
+    if not args.no_cache:
+        prog_cache = Cache(args.cache_dir or os.path.join(SRC, PROG_FILE_NAME))
+    else:
+        prog_cache = Cache(None)
 
     if args.reset:
         print('Resetting failed file database...')
