@@ -89,7 +89,7 @@ def cmp(src, dst, shallow):
         return filecmp.cmp(src, dst, shallow=shallow)
     elif paths_are(os.path.isdir, src, dst):
         dcmp = filecmp.dircmp(src, dst)
-        return bool(dcmp.left_only or dcmp.right_only or dcmp.diff_files)
+        return not bool(dcmp.left_only or dcmp.right_only or dcmp.diff_files)
 
     return False
 
@@ -239,7 +239,12 @@ def check_meta_ls(old, new):
     for idx, (src, dst) in enumerate(zip(old, new), start=1):
         # We can skip meta check for symlinks since the files they point to will be checked
         if not paths_are(os.path.islink, src, dst, cmp_func=any):
-            check_meta(src, dst)
+            try:
+                check_meta(src, dst)
+            except PermissionError:
+                print(f'Permission error on {dst}. Skipping')
+            except Exception as e:
+                print(f'Error restoring meta to {dst}.\nError is {e}')
         print(f'Restored {idx}/{ls_len}...', end='\r')
     print()
 
@@ -275,12 +280,13 @@ if __name__ == '__main__':
     parser.add_argument('-a', '--attempts', help='number of attempts before giving up on a file',
                         type=int, default=5)
     parser.add_argument('-e', '--exclude', help='space-separated list of file patterns to exclude',
-                        nargs='+', default=[f'*{PROG_FILE_NAME}*'])
+                        nargs='+', default=[])
     args = parser.parse_args()
 
     SRC = args.src
     DST = args.dst
     ATTEMPTS = args.attempts
+    args.exclude.insert(0, f'*{PROG_FILE_NAME}*')  # Ensure progress files are excluded
 
     # The progress file
     print('Loading progress file...')
