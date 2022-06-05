@@ -17,9 +17,10 @@ PROG_FILE_NAME = '.cp_progress'
 manager = NSFileManager.defaultManager()
 
 
-# TODO: see what's up with all these fchflags errors. A directory
-#  that had a ton of them is /Volumes/Archive/ARCHIVE/B/Brower.
-#  Maybe have a command line arg to retry failed files instantly with shutil.copy2.
+# NOTE: found what's up with the fchflags errors. Files are being copied, and then fchflags is trying
+# to preserve the file's flags, which are incompatible when going across different filesystems.
+# In this particular case, the nodump flag was set on the files. It might be good to add an arg
+# that ignores these errors. You can check a file's flags with os.stat().st_flags.
 
 
 def cp(src, dst):
