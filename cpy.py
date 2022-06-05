@@ -17,15 +17,9 @@ PROG_FILE_NAME = '.cp_progress'
 manager = NSFileManager.defaultManager()
 
 
-# NOTE: found what's up with the fchflags errors. Files are being copied, and then fchflags is trying
-# to preserve the file's flags, which are incompatible when going across different filesystems.
-# In this particular case, the nodump flag was set on the files. It might be good to add an arg
-# that ignores these errors. You can check a file's flags with os.stat().st_flags.
-
-
 def cp(src, dst):
     """Copies src to dst. Uses flags -Rpn to preserve resource forks."""
-    res = subprocess.run(['/bin/cp', '-Rpn', src, f'{os.path.dirname(dst)}'], check=True)
+    res = subprocess.run(['/bin/cp', '-Rpn', src, f'{os.path.dirname(dst)}'], check=True, capture_output=True)
     return res
 
 
@@ -103,6 +97,10 @@ def cp_ls(src_ls, dst_ls):
     it is added to a list of exceptions.
     The exception list is formatted like this: [[src, dst, exception], [src2, dst2, exception2], etc...]
     """
+
+    def is_chflag_err():
+        return all([b in e.stderr for b in (b'chflags: ', b': Invalid argument')])
+
     errs = []
     for idx, (src, dst) in enumerate(zip(src_ls, dst_ls), start=1):
         prev_err = prog_cache.get(src)
@@ -133,10 +131,17 @@ def cp_ls(src_ls, dst_ls):
                     os.makedirs(dst, exist_ok=True)
                 else:
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
-                    cp(src, dst)
+                    try:
+                        cp(src, dst)
+                    except subprocess.CalledProcessError as e:
+                        # Test to see if chflags: invalid argument is what caused this error
+                        if not args.ignore_chflags_err or not is_chflag_err():
+                            raise
+
             clone_attrs(src, dst, follow_symlinks=not os.path.islink(dst), limit=50)
             prog_cache.delete(src)
         except Exception as e:
+            print(f'Error on file\n\t {src}\n\t{e}')
             if prev_err is None:
                 prog_cache.set(src, {'src': src, 'dst': dst, 'attempts': 1,
                                      'exception': e, 'traceback': traceback.format_exc()})
@@ -282,6 +287,8 @@ if __name__ == '__main__':
                         type=int, default=5)
     parser.add_argument('-e', '--exclude', help='space-separated list of file patterns to exclude',
                         nargs='+', default=[])
+    parser.add_argument('--ignore-chflags-err',
+                        help="don't count 'chflags: invalid argument' as an error", action='store_true')
     args = parser.parse_args()
 
     SRC = args.src
